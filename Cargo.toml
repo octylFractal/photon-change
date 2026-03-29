@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Octavia Togami <octy@octyl.net>
+#
+# SPDX-License-Identifier: CC-BY-NC-SA-4.0
+
+[package]
+name = "photon-change"
+authors = ["Octavia Togami"]
+description = "A CLI tool to correct the file extension of an image file based on its content."
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+infer = "0.19"
+walkdir = "2.5"
+error-stack = "0.7.0"
+
+[dependencies.clap]
+version = "4.6"
+features = ["derive", "env", "wrap_help"]
+
+[dependencies.derive_more]
+version = "2.1.1"
+features = ["display", "error"]
+
+[dependencies.futures]
+version = "0.3"
+default-features = false
+features = ["std"]
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "macros", "fs"]
+
+[dev-dependencies]
+assert_cmd = "2.2"
+predicates = "3.1"
+assert_fs = "1.1"
