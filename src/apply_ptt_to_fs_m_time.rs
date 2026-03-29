@@ -171,44 +171,49 @@ async fn find_google_photos_supplemental_metadata(image_path: &Path) -> AppResul
                 .attach("Image file name is not valid UTF-8")
         })?;
 
+    fn make_candidate(base: &str, number_suffix: Option<&str>) -> String {
+        let full = format!(
+            "{base}.supplemental-metadata{}",
+            number_suffix.unwrap_or_default()
+        );
+        // I have no idea if Google Photos determines the length by chars or bytes...
+        // We'll go with chars for now.
+        full.chars()
+            .take(TARGET_SIZE_WITHOUT_DOT_JSON)
+            .collect::<String>()
+            + ".json"
+    }
+
+    let mut candidates: Vec<String> = Vec::with_capacity(2);
+
+    candidates.push(make_candidate(image_base_name, None));
+
+    // For (n), it may or may not be added at the end instead. Try both options by leaving the
+    // normal one and adding this new one.
     static NUMBER_SUFFIX_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^(.+?)(\(\d+\))(\..+)$").unwrap());
-    // Pull off any (1)
-    let (image_base_name, number_suffix) = if let Some(captures) =
-        NUMBER_SUFFIX_RE.captures(image_base_name)
+    if let Some(captures) = NUMBER_SUFFIX_RE.captures(image_base_name)
         && let Some(base) = captures.get(1)
         && let Some(num_suffix) = captures.get(2)
         && let Some(ext) = captures.get(3)
     {
-        (
-            Cow::Owned(base.as_str().to_owned()) + ext.as_str(),
+        let base_without_suffix = Cow::Owned(base.as_str().to_owned()) + ext.as_str();
+        candidates.push(make_candidate(
+            &base_without_suffix,
             Some(num_suffix.as_str()),
-        )
-    } else {
-        (Cow::Borrowed(image_base_name), None)
-    };
-
-    // And add the (1) on the end here
-    let full_supplemental_name = format!(
-        "{image_base_name}.supplemental-metadata{}",
-        number_suffix.unwrap_or_default()
-    );
-    // I have no idea if Google Photos determines the length by chars or bytes...
-    // We'll go with chars for now.
-    let real_supplemental_name = full_supplemental_name
-        .chars()
-        .take(TARGET_SIZE_WITHOUT_DOT_JSON)
-        .collect::<String>()
-        + ".json";
-
-    let supplemental_metadata_path = image_path.with_file_name(&real_supplemental_name);
-    if tokio::fs::try_exists(&supplemental_metadata_path)
-        .await
-        .change_context(AppError::GooglePhotosMetadataFileLookupFailed)
-        .attach("Could not test for existence of JSON metadata file")?
-    {
-        Ok(Some(supplemental_metadata_path))
-    } else {
-        Ok(None)
+        ));
     }
+
+    for candidate_name in &candidates {
+        let candidate_path = image_path.with_file_name(candidate_name);
+        if tokio::fs::try_exists(&candidate_path)
+            .await
+            .change_context(AppError::GooglePhotosMetadataFileLookupFailed)
+            .attach("Could not test for existence of JSON metadata file")?
+        {
+            return Ok(Some(candidate_path));
+        }
+    }
+
+    Ok(None)
 }
