@@ -11,6 +11,7 @@ use assert_fs::fixture::{FileWriteBin, PathChild};
 use common::{PNG_HEADER, assert_cmd, path_str};
 use predicate::path;
 use predicate::str::contains;
+use predicates::boolean::PredicateBooleanExt;
 use predicates::prelude::predicate;
 
 pub static JPEG_HEADER: &[u8] = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00";
@@ -21,7 +22,7 @@ fn dry_run_reports_rename_without_mutating() {
     let wrong = temp.child("photo.jpg");
     wrong.write_binary(PNG_HEADER).expect("write fixture");
 
-    assert_cmd([path_str(&wrong)])
+    assert_cmd(["--actions=fix-image-extension", path_str(&wrong)])
         .success()
         .stdout(contains("Would rename"));
 
@@ -40,13 +41,17 @@ fn rename_applies_for_mismatched_extension() {
 
     let target = temp.child("photo.png");
 
-    assert_cmd(["--execute", path_str(&wrong)])
-        .success()
-        .stdout(contains(format!(
-            "Renamed {} to {}",
-            wrong.path().display(),
-            target.path().display()
-        )));
+    assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&wrong),
+    ])
+    .success()
+    .stdout(contains(format!(
+        "Renamed {} to {}",
+        wrong.path().display(),
+        target.path().display()
+    )));
 
     wrong.assert(path::missing());
     target.assert(path::exists());
@@ -76,9 +81,13 @@ fn changes_jpeg_alias_when_type_matches() {
 
     let target = temp.child("camera.jpg");
 
-    assert_cmd(["--execute", path_str(&wrong)])
-        .success()
-        .stdout(contains("Renamed 1 file(s)"));
+    assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&wrong),
+    ])
+    .success()
+    .stdout(contains("Fixed image extensions 1 time(s)"));
 
     wrong.assert(path::missing());
     target.assert(path::exists());
@@ -94,9 +103,13 @@ fn leaves_upper_case_extension_when_type_matches() {
     let upper = temp.child("camera.JPG");
     upper.write_binary(JPEG_HEADER).expect("write fixture");
 
-    assert_cmd(["--execute", path_str(&upper)])
-        .success()
-        .stdout(contains("Renamed 0 file(s)"));
+    assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&upper),
+    ])
+    .success()
+    .stdout(contains("Fixed image extensions").not());
 
     upper.assert(path::exists());
     assert_eq!(
@@ -128,9 +141,13 @@ fn skips_when_target_exists() {
     let target = temp.child("photo.png");
     fs::write(target.path(), b"already here").expect("create collision");
 
-    assert_cmd(["--execute", path_str(&wrong)])
-        .success()
-        .stderr(contains("target already exists"));
+    assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&wrong),
+    ])
+    .success()
+    .stderr(contains("target already exists"));
 
     wrong.assert(path::exists());
     assert_eq!(
@@ -149,9 +166,13 @@ fn skips_when_target_exists_case_insensitive() {
     let target = temp.child("photo.PNG");
     fs::write(target.path(), b"already here").expect("create collision");
 
-    assert_cmd(["--execute", path_str(&wrong)])
-        .success()
-        .stderr(contains("target already exists"));
+    assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&wrong),
+    ])
+    .success()
+    .stderr(contains("target already exists"));
 
     wrong.assert(path::exists());
     assert_eq!(
@@ -172,7 +193,13 @@ fn output_is_in_input_order() {
     z.write_binary(PNG_HEADER).expect("write fixture");
     a.write_binary(PNG_HEADER).expect("write fixture");
 
-    let result = assert_cmd(["--execute", path_str(&z), path_str(&a)]).success();
+    let result = assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&z),
+        path_str(&a),
+    ])
+    .success();
     let stdout = String::from_utf8_lossy(&result.get_output().stdout);
 
     let pos_z = stdout.find("z.png").expect("z.png in output");
@@ -188,10 +215,14 @@ fn fails_for_missing_input_path() {
     let temp = assert_fs::TempDir::new().expect("temp dir");
     let missing = temp.child("missing.png");
 
-    assert_cmd(["--execute", path_str(&missing)])
-        .failure()
-        .stderr(contains("Invalid input path"))
-        .stderr(contains("Input path does not exist"));
+    assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&missing),
+    ])
+    .failure()
+    .stderr(contains("Invalid input path"))
+    .stderr(contains("Input path does not exist"));
 }
 
 #[test]
@@ -203,13 +234,17 @@ fn preserves_unknown_extension_and_appends_canonical() {
 
     let target = temp.child("photo.com_foobar.png");
 
-    assert_cmd(["--execute", path_str(&file)])
-        .success()
-        .stdout(contains(format!(
-            "Renamed {} to {}",
-            file.path().display(),
-            target.path().display()
-        )));
+    assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&file),
+    ])
+    .success()
+    .stdout(contains(format!(
+        "Renamed {} to {}",
+        file.path().display(),
+        target.path().display()
+    )));
 
     // Original file must be gone and the unknown extension must be kept intact.
     file.assert(path::missing());
@@ -227,9 +262,14 @@ fn failure_on_missing_path_does_not_apply_other_renames() {
     wrong.write_binary(PNG_HEADER).expect("write fixture");
     let missing = temp.child("missing.png");
 
-    assert_cmd(["--execute", path_str(&wrong), path_str(&missing)])
-        .failure()
-        .stderr(contains("Invalid input path"));
+    assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&wrong),
+        path_str(&missing),
+    ])
+    .failure()
+    .stderr(contains("Invalid input path"));
 
     wrong.assert(path::exists());
     temp.child("photo.png").assert(path::missing());

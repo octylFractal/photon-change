@@ -2,16 +2,23 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use std::collections::HashSet;
+mod apply_ptt_to_fs_m_time;
+mod fix_image_ext;
+mod infer_cache;
+mod walk_dir_stream;
+
+use crate::walk_dir_stream::walk_dir_stream;
+use async_trait::async_trait;
+use clap::{Parser, ValueEnum};
+use counter::Counter;
+use derive_more::{Display, Error};
+use error_stack::Report;
+use futures::{Stream, StreamExt, TryStreamExt};
+use infer::MatcherType;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::pin;
 use std::process::ExitCode;
-
-use clap::Parser;
-use derive_more::{Display, Error};
-use error_stack::{Report, ResultExt};
-use futures::{Stream, StreamExt};
 use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
@@ -21,11 +28,15 @@ struct Cli {
     /// Defaults to the current directory.
     paths: Vec<PathBuf>,
 
+    /// Actions to take.
+    #[arg(long, value_enum)]
+    actions: Vec<Action>,
+
     /// Silence unsupported file warnings.
     #[arg(long)]
     silence_unsupported_file_warnings: bool,
 
-    /// Execute the rename, instead of doing a dry-run.
+    /// Execute the actions, instead of doing a dry-run.
     #[arg(long)]
     execute: bool,
 }
@@ -33,6 +44,34 @@ struct Cli {
 #[derive(Copy, Clone, Debug)]
 struct LogContext {
     unsupported_file_warnings: bool,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Action {
+    /// Fix the image extension based on the file contents.
+    FixImageExtension,
+    /// Apply the `photoTakenTime` from Google Photos json metadata to the modification time on the
+    /// file system of the relevant file.
+    ApplyPhotoTakenTimeToFilesystemMTime,
+}
+
+impl Action {
+    fn build_plans(
+        self,
+        log_context: LogContext,
+        paths: Vec<PathBuf>,
+    ) -> impl Stream<Item = AppResult<Box<dyn Plan>>> {
+        match self {
+            Self::FixImageExtension => fix_image_ext::build_plans(log_context, paths)
+                .map_ok(|plan| Box::new(plan) as Box<dyn Plan>)
+                .boxed(),
+            Self::ApplyPhotoTakenTimeToFilesystemMTime => {
+                apply_ptt_to_fs_m_time::build_plans(log_context, paths)
+                    .map_ok(|plan| Box::new(plan) as Box<dyn Plan>)
+                    .boxed()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Display, Error)]
@@ -45,6 +84,10 @@ enum AppError {
     FileTypeDetection,
     #[display("Failed to rename file")]
     RenameFailed,
+    #[display("Failed to locate Google Photos metadata file")]
+    GooglePhotosMetadataFileLookupFailed,
+    #[display("Failed to apply Google Photos metadata")]
+    GooglePhotosMetadataApplyFailed,
     #[display("One or more operations failed")]
     SomeFailed,
 }
@@ -79,9 +122,22 @@ impl ImageKind {
 }
 
 #[derive(Debug)]
-struct RenamePlan {
-    from: PathBuf,
-    to: PathBuf,
+pub(crate) struct PlanResult {
+    /// Will be displayed to the user as-is immediately.
+    description: String,
+}
+
+/// A plan that may be shown or executed.
+#[async_trait]
+pub(crate) trait Plan {
+    /// Will be displayed as `"{action_name} {number} time(s)."` at the end.
+    fn action_name(&self) -> String;
+
+    fn dry_run_action_name(&self) -> String;
+
+    fn describe_dry_run(&self) -> String;
+
+    async fn execute(&self) -> AppResult<PlanResult>;
 }
 
 #[tokio::main]
@@ -111,234 +167,106 @@ async fn run() -> AppResult<()> {
     }
 
     let targets = collect_targets(&cli.paths).await?;
-    let plans = build_rename_plans(log_context, targets);
+    let plans = futures::stream::iter(cli.actions.into_iter()).flat_map(|action| {
+        let targets = targets.clone();
+        action.build_plans(log_context, targets)
+    });
 
     if cli.execute {
         let (renamed, result) = apply_plan(plans).await;
-        println!("Done. Renamed {} file(s).", renamed);
+        let sorted_keys = {
+            let mut keys: Vec<_> = renamed.keys().collect();
+            keys.sort();
+            keys
+        };
+        println!("Done.");
+        for key in sorted_keys {
+            println!("{} {} time(s).", key, renamed[key]);
+        }
         result
     } else {
         let (would_rename, result) = print_plan(plans).await;
-        println!(
-            "Dry run complete. {} file(s) would be renamed.",
-            would_rename
-        );
+        let sorted_keys = {
+            let mut keys: Vec<_> = would_rename.keys().collect();
+            keys.sort();
+            keys
+        };
+        println!("Dry run complete.");
+        for key in sorted_keys {
+            println!("{} {} time(s).", key, would_rename[key]);
+        }
         result
     }
 }
 
 async fn collect_targets(inputs: &[PathBuf]) -> AppResult<Vec<PathBuf>> {
-    let mut targets = Vec::new();
+    futures::stream::iter(inputs)
+        .flat_map(|input| {
+            if !input.exists() {
+                return futures::stream::once(futures::future::err(
+                    Report::new(AppError::InvalidInputPath)
+                        .attach(format!("Input path does not exist: {}", input.display())),
+                ))
+                .boxed();
+            }
 
-    for input in inputs {
-        if !input.exists() {
-            return Err(Report::new(AppError::InvalidInputPath)
-                .attach(format!("Input path does not exist: {}", input.display())));
-        }
+            if input.is_file() {
+                return futures::stream::once(futures::future::ok(input.clone())).boxed();
+            }
 
-        if input.is_file() {
-            targets.push(input.clone());
-            continue;
-        }
+            if input.is_dir() {
+                return walk_dir_stream(WalkDir::new(input.clone()).sort_by_file_name())
+                    .filter_map(|entry_result| async {
+                        match entry_result {
+                            Ok(entry) if entry.path().is_file() => Some(Ok(entry.into_path())),
+                            Ok(_) => None,
+                            Err(e) => {
+                                Some(Err(Report::new(AppError::DirectoryTraversal).attach(e)))
+                            }
+                        }
+                    })
+                    .boxed();
+            }
 
-        if input.is_dir() {
-            let root = input.clone();
-            let files = tokio::task::spawn_blocking(move || {
-                let mut acc = Vec::new();
-                for entry in WalkDir::new(&root) {
-                    let entry = entry.change_context(AppError::DirectoryTraversal)?;
-                    if entry.path().is_file() {
-                        acc.push(entry.into_path());
-                    }
-                }
-                Ok::<_, Report<AppError>>(acc)
-            })
-            .await
-            .expect("WalkDir task panicked")?;
-
-            targets.extend(files);
-        }
-    }
-
-    Ok(targets)
-}
-
-fn build_rename_plans(
-    log_context: LogContext,
-    paths: Vec<PathBuf>,
-) -> impl Stream<Item = AppResult<RenamePlan>> {
-    use futures::StreamExt;
-
-    futures::stream::iter(paths.into_iter().map(|path| async move {
-        let result = tokio::task::spawn_blocking({
-            let path = path.clone();
-            move || detect_image_kind(&path)
+            futures::stream::empty().boxed()
         })
+        .try_filter(|path| {
+            let path = path.clone();
+            async move {
+                let Ok(Some(kind)) = infer_cache::get_from_path(&path) else {
+                    // Maybe it's a JSON file for the metadata
+                    if let Some(ext) = path.extension().and_then(OsStr::to_str)
+                        && ext.eq_ignore_ascii_case("json")
+                    {
+                        return false;
+                    }
+
+                    // If we can't infer, assume it's valid
+                    return true;
+                };
+                // Retain only files that look like images or video.
+                if matches!(kind.matcher_type(), MatcherType::Image | MatcherType::Video) {
+                    return true;
+                }
+
+                false
+            }
+        })
+        .try_collect::<Vec<PathBuf>>()
         .await
-        .expect("detect_image_kind task panicked");
-        (path, result)
-    }))
-    .buffered(64)
-    .scan(
-        HashSet::<PathBuf>::new(),
-        move |reserved, (path, detected)| {
-            futures::future::ready(Some(plan_rename(log_context, reserved, path, detected)))
-        },
-    )
-    .flat_map(futures::stream::iter)
 }
 
-/// Normalize a path for case-insensitive comparison by lowercasing only the
-/// final filename component, leaving the directory part unchanged.
-fn ci_key(path: &Path) -> PathBuf {
-    match path.file_name().and_then(OsStr::to_str) {
-        Some(name) => match path.parent() {
-            Some(parent) => parent.join(name),
-            None => PathBuf::from(name),
-        },
-        None => path.to_path_buf(),
-    }
-}
-
-/// Returns `true` if any entry in `target`'s parent directory has the same
-/// name as `target` when compared case-insensitively.  This handles
-/// case-sensitive file systems where `photo.PNG` and `photo.png` are distinct
-/// paths but should still be treated as a collision.
-fn target_exists_case_insensitive(target: &Path) -> bool {
-    if target.exists() {
-        return true;
-    }
-    let parent = target.parent().unwrap_or(Path::new("."));
-    let file_name = match target.file_name().and_then(OsStr::to_str) {
-        Some(n) => n,
-        None => return false,
-    };
-    let file_name_lower = file_name.to_ascii_lowercase();
-    if let Ok(entries) = std::fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            if let Some(entry_name) = entry.file_name().to_str()
-                && entry_name.to_ascii_lowercase() == file_name_lower
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Decide whether a single detected file produces a [`RenamePlan`].
-///
-/// Returns `Some(Ok(plan))` when a rename is needed, `Some(Err(_))` when
-/// detection failed, and `None` to silently skip the file.
-fn plan_rename(
-    log_context: LogContext,
-    reserved: &mut HashSet<PathBuf>,
-    path: PathBuf,
-    detected: AppResult<Option<ImageKind>>,
-) -> Option<AppResult<RenamePlan>> {
-    let detected_kind = match detected {
-        Err(e) => return Some(Err(e)),
-        Ok(None) => {
-            if log_context.unsupported_file_warnings {
-                eprintln!("Skipping {} (not a supported image file)", path.display());
-            }
-            return None;
-        }
-        Ok(Some(kind)) => kind,
-    };
-
-    let current_ext = path.extension().and_then(OsStr::to_str);
-    let current_kind = current_ext.and_then(extension_to_kind);
-
-    if let Some(current_ext) = current_ext
-        && current_ext.eq_ignore_ascii_case(detected_kind.canonical_extension())
-    {
-        // The file already has the correct extension (case-insensitive match).
-        // No rename needed.
-        return None;
-    }
-
-    // Only replace the extension if it is a known image extension.
-    // If the extension is unrecognized (e.g. `.com_foobar`), keep it and
-    // append the canonical extension so nothing is silently discarded.
-    let target = if current_ext.is_some() && current_kind.is_none() {
-        path.with_added_extension(detected_kind.canonical_extension())
-    } else {
-        path.with_extension(detected_kind.canonical_extension())
-    };
-
-    if target == path {
-        return None;
-    }
-
-    if target_exists_case_insensitive(&target) || reserved.contains(&ci_key(&target)) {
-        eprintln!(
-            "Skipping {} (target already exists: {})",
-            path.display(),
-            target.display()
-        );
-        return None;
-    }
-
-    reserved.insert(ci_key(&target));
-    Some(Ok(RenamePlan {
-        from: path,
-        to: target,
-    }))
-}
-
-fn detect_image_kind(path: &Path) -> AppResult<Option<ImageKind>> {
-    let kind = infer::get_from_path(path)
-        .change_context(AppError::FileTypeDetection)
-        .attach(format!("Failed to inspect file type: {}", path.display()))?;
-
-    let Some(kind) = kind else {
-        return Ok(None);
-    };
-
-    let detected = match kind.mime_type() {
-        "image/jpeg" => Some(ImageKind::Jpeg),
-        "image/png" => Some(ImageKind::Png),
-        "image/gif" => Some(ImageKind::Gif),
-        "image/bmp" => Some(ImageKind::Bmp),
-        "image/tiff" => Some(ImageKind::Tiff),
-        "image/webp" => Some(ImageKind::Webp),
-        "image/x-icon" => Some(ImageKind::Ico),
-        "image/avif" => Some(ImageKind::Avif),
-        _ => None,
-    };
-
-    Ok(detected)
-}
-
-fn extension_to_kind(ext: &str) -> Option<ImageKind> {
-    match ext.to_ascii_lowercase().as_str() {
-        // .jfif is a subset of jpeg
-        "jpg" | "jpeg" | "jpe" | "jfif" => Some(ImageKind::Jpeg),
-        "png" => Some(ImageKind::Png),
-        "gif" => Some(ImageKind::Gif),
-        "bmp" => Some(ImageKind::Bmp),
-        "tif" | "tiff" => Some(ImageKind::Tiff),
-        "webp" => Some(ImageKind::Webp),
-        "ico" => Some(ImageKind::Ico),
-        "avif" => Some(ImageKind::Avif),
-        _ => None,
-    }
-}
-
-async fn print_plan(plans: impl Stream<Item = AppResult<RenamePlan>>) -> (usize, AppResult<()>) {
+async fn print_plan(
+    plans: impl Stream<Item = AppResult<Box<dyn Plan>>>,
+) -> (Counter<String>, AppResult<()>) {
     futures::pin_mut!(plans);
-    let mut count = 0usize;
+    let mut executed = Counter::new();
     let mut had_error = false;
     while let Some(plan_result) = plans.next().await {
         match plan_result {
             Ok(plan) => {
-                println!(
-                    "Would rename {} to {}",
-                    plan.from.display(),
-                    plan.to.display()
-                );
-                count += 1;
+                println!("{}", plan.describe_dry_run());
+                executed[&plan.dry_run_action_name()] += 1;
             }
             Err(e) => {
                 eprintln!("{e:?}");
@@ -351,36 +279,31 @@ async fn print_plan(plans: impl Stream<Item = AppResult<RenamePlan>>) -> (usize,
     } else {
         Ok(())
     };
-    (count, result)
+    (executed, result)
 }
 
 /// Rename all planned files concurrently; results are reported in input order.
-async fn apply_plan(plans: impl Stream<Item = AppResult<RenamePlan>>) -> (usize, AppResult<()>) {
+async fn apply_plan(
+    plans: impl Stream<Item = AppResult<Box<dyn Plan>>>,
+) -> (Counter<String>, AppResult<()>) {
     use futures::TryStreamExt;
 
     let mut stream = pin!(
         plans
             .map_ok(|plan| async move {
-                tokio::fs::rename(&plan.from, &plan.to)
-                    .await
-                    .change_context(AppError::RenameFailed)
-                    .attach(format!(
-                        "Failed to rename {} to {}",
-                        plan.from.display(),
-                        plan.to.display()
-                    ))
-                    .map(|_| plan)
+                let result = plan.execute().await;
+                result.map(|r| (plan, r))
             })
             .try_buffered(64)
     );
 
-    let mut renamed = 0usize;
+    let mut executed = Counter::new();
     let mut had_error = false;
     while let Some(plan_result) = stream.next().await {
         match plan_result {
-            Ok(plan) => {
-                println!("Renamed {} to {}", plan.from.display(), plan.to.display());
-                renamed += 1;
+            Ok((plan, pr)) => {
+                println!("{}", pr.description);
+                executed[&plan.action_name()] += 1;
             }
             Err(e) => {
                 eprintln!("{e:?}");
@@ -393,5 +316,5 @@ async fn apply_plan(plans: impl Stream<Item = AppResult<RenamePlan>>) -> (usize,
     } else {
         Ok(())
     };
-    (renamed, result)
+    (executed, result)
 }

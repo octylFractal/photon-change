@@ -15,6 +15,7 @@ use assert_fs::fixture::{FileWriteBin, PathChild};
 use common::{PNG_HEADER, assert_cmd, path_str};
 use predicate::path;
 use predicate::str::contains;
+use predicates::boolean::PredicateBooleanExt;
 use predicates::prelude::predicate;
 
 fn chmod(path: &Path, mode: u32) {
@@ -29,11 +30,15 @@ fn fails_when_file_type_detection_cannot_read_file() {
     unreadable.write_binary(PNG_HEADER).expect("write fixture");
     chmod(unreadable.path(), 0o000);
 
-    assert_cmd(["--execute", path_str(&unreadable)])
-        .failure()
-        .stdout(contains("Done. Renamed 0 file(s)."))
-        .stderr(contains("Failed to detect file type"))
-        .stderr(contains("Failed to inspect file type"));
+    assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&unreadable),
+    ])
+    .failure()
+    .stdout(contains("Fixed image extensions").not())
+    .stderr(contains("Failed to detect file type"))
+    .stderr(contains("Failed to inspect file type"));
 
     chmod(unreadable.path(), 0o644);
     unreadable.assert(path::exists());
@@ -51,9 +56,13 @@ fn fails_when_recursive_directory_traversal_hits_unreadable_directory() {
         .expect("write fixture");
     chmod(blocked_dir.path(), 0o000);
 
-    assert_cmd(["--execute", path_str(&temp)])
-        .failure()
-        .stderr(contains("Failed to traverse directory"));
+    assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&temp),
+    ])
+    .failure()
+    .stderr(contains("Failed to traverse directory"));
 
     chmod(blocked_dir.path(), 0o755);
     blocked_file.assert(path::exists());
@@ -67,11 +76,15 @@ fn fails_when_rename_cannot_write_to_parent_directory() {
     wrong.write_binary(PNG_HEADER).expect("write fixture");
     chmod(temp.path(), 0o555);
 
-    assert_cmd(["--execute", path_str(&wrong)])
-        .failure()
-        .stdout(contains("Done. Renamed 0 file(s)."))
-        .stderr(contains("Failed to rename file"))
-        .stderr(contains("Failed to rename"));
+    assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&wrong),
+    ])
+    .failure()
+    .stdout(contains("Fixed image extensions").not())
+    .stderr(contains("Failed to rename file"))
+    .stderr(contains("Failed to rename"));
 
     chmod(temp.path(), 0o755);
     wrong.assert(path::exists());
@@ -91,11 +104,16 @@ fn unreadable_file_does_not_stop_processing_of_other_files() {
 
     // Pass good before bad so the stream yields good's plan first, then bad's
     // error. Both are processed; the exit code is 1 because of bad.
-    assert_cmd(["--execute", path_str(&good), path_str(&bad)])
-        .failure()
-        .stdout(contains("Done. Renamed 1 file(s)."))
-        .stdout(contains("Renamed"))
-        .stderr(contains("Failed to detect file type"));
+    assert_cmd([
+        "--execute",
+        "--actions=fix-image-extension",
+        path_str(&good),
+        path_str(&bad),
+    ])
+    .failure()
+    .stdout(contains("Fixed image extensions 1 time(s)."))
+    .stdout(contains("Renamed"))
+    .stderr(contains("Failed to detect file type"));
 
     // The good file was renamed despite the error on bad.
     temp.child("good.png").assert(path::exists());
