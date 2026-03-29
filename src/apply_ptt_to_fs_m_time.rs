@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::{AppError, AppResult, LogContext, Plan, PlanResult};
+use crate::{AppContext, AppError, AppResult, Plan, PlanResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use error_stack::{Report, ResultExt};
@@ -91,7 +91,7 @@ struct TimeInfo {
 }
 
 pub(crate) fn build_plans(
-    log_context: LogContext,
+    app_context: AppContext,
     paths: Vec<PathBuf>,
 ) -> impl Stream<Item = AppResult<ApplyPttToFsMTimePlan>> {
     use futures::StreamExt;
@@ -105,7 +105,7 @@ pub(crate) fn build_plans(
         let Some(metadata_path) =
             metadata_result.attach_with(|| format!("Image path: {:?}", path))?
         else {
-            if log_context.unsupported_file_warnings {
+            if app_context.unsupported_file_warnings {
                 eprintln!(
                     "Skipping {} (unsupported, no Google Photos metadata)",
                     path.display()

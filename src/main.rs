@@ -36,13 +36,18 @@ struct Cli {
     #[arg(long)]
     silence_unsupported_file_warnings: bool,
 
+    /// Overwrite existing files.
+    #[arg(long)]
+    overwrite: bool,
+
     /// Execute the actions, instead of doing a dry-run.
     #[arg(long)]
     execute: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
-struct LogContext {
+struct AppContext {
+    overwrite: bool,
     unsupported_file_warnings: bool,
 }
 
@@ -58,7 +63,7 @@ enum Action {
 impl Action {
     fn build_plans(
         self,
-        log_context: LogContext,
+        log_context: AppContext,
         paths: Vec<PathBuf>,
     ) -> impl Stream<Item = AppResult<Box<dyn Plan>>> {
         match self {
@@ -158,7 +163,8 @@ async fn main() -> ExitCode {
 async fn run() -> AppResult<()> {
     let mut cli = Cli::parse();
 
-    let log_context = LogContext {
+    let log_context = AppContext {
+        overwrite: cli.overwrite,
         unsupported_file_warnings: !cli.silence_unsupported_file_warnings,
     };
 

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::{AppError, AppResult, ImageKind, LogContext, Plan, PlanResult, infer_cache};
+use crate::{AppContext, AppError, AppResult, ImageKind, Plan, PlanResult, infer_cache};
 use async_trait::async_trait;
 use error_stack::ResultExt;
 use futures::Stream;
@@ -52,7 +52,7 @@ impl Plan for FixImageExtPlan {
 }
 
 pub(crate) fn build_plans(
-    log_context: LogContext,
+    log_context: AppContext,
     paths: Vec<PathBuf>,
 ) -> impl Stream<Item = AppResult<FixImageExtPlan>> {
     use futures::StreamExt;
@@ -119,7 +119,7 @@ fn target_exists_case_insensitive(target: &Path) -> bool {
 /// Returns `Some(Ok(plan))` when a rename is needed, `Some(Err(_))` when
 /// detection failed, and `None` to silently skip the file.
 fn plan_rename(
-    log_context: LogContext,
+    app_context: AppContext,
     reserved: &mut HashSet<PathBuf>,
     path: PathBuf,
     detected: AppResult<Option<ImageKind>>,
@@ -127,7 +127,7 @@ fn plan_rename(
     let detected_kind = match detected {
         Err(e) => return Some(Err(e)),
         Ok(None) => {
-            if log_context.unsupported_file_warnings {
+            if app_context.unsupported_file_warnings {
                 eprintln!("Skipping {} (unsupported image file)", path.display());
             }
             return None;
@@ -159,7 +159,9 @@ fn plan_rename(
         return None;
     }
 
-    if target_exists_case_insensitive(&target) || reserved.contains(&ci_key(&target)) {
+    if !app_context.overwrite
+        && (target_exists_case_insensitive(&target) || reserved.contains(&ci_key(&target)))
+    {
         eprintln!(
             "Skipping {} (target already exists: {})",
             path.display(),
