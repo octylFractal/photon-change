@@ -14,7 +14,7 @@ SPDX-License-Identifier: CC-BY-NC-SA-4.0
   - Detects image type from file content
 - Can apply the `photoTakenTime` from Google Photos json metadata files to the _file_ modification time.
   - This is primarily good for forcing the Memories Nextcloud add-on to sort photos properly.
-- Supports `--dry-run` to preview changes
+- Runs a dry-run by default, with `--execute` to actually apply changes.
 - Traverses directories recursively by default
 
 ## Install / Build

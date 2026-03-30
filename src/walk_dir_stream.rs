@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use crate::toki_oh::asyncify;
 use futures::Stream;
 use walkdir::WalkDir;
 
@@ -10,11 +11,9 @@ pub(crate) fn walk_dir_stream(
 ) -> impl Stream<Item = walkdir::Result<walkdir::DirEntry>> {
     let iter = walk_dir.into_iter();
     futures::stream::unfold(iter, |mut iter| {
-        let blocking_future = tokio::task::spawn_blocking(move || {
+        asyncify("walk_dir", move || {
             let option = iter.next();
             option.map(|r| (r, iter))
-        });
-
-        async move { blocking_future.await.expect("walk_dir next panicked") }
+        })
     })
 }

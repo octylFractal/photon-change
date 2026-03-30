@@ -4,7 +4,9 @@
 
 mod apply_ptt_to_fs_m_time;
 mod fix_image_ext;
+mod google_photos;
 mod infer_cache;
+mod toki_oh;
 mod walk_dir_stream;
 
 use crate::walk_dir_stream::walk_dir_stream;
@@ -12,7 +14,7 @@ use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use counter::Counter;
 use derive_more::{Display, Error};
-use error_stack::Report;
+use error_stack::{IntoReport, Report};
 use futures::{Stream, StreamExt, TryStreamExt};
 use infer::MatcherType;
 use std::ffi::OsStr;
@@ -99,33 +101,6 @@ enum AppError {
 
 type AppResult<T> = Result<T, Report<AppError>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImageKind {
-    Jpeg,
-    Png,
-    Gif,
-    Bmp,
-    Tiff,
-    Webp,
-    Ico,
-    Avif,
-}
-
-impl ImageKind {
-    fn canonical_extension(self) -> &'static str {
-        match self {
-            Self::Jpeg => "jpg",
-            Self::Png => "png",
-            Self::Gif => "gif",
-            Self::Bmp => "bmp",
-            Self::Tiff => "tif",
-            Self::Webp => "webp",
-            Self::Ico => "ico",
-            Self::Avif => "avif",
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct PlanResult {
     /// Will be displayed to the user as-is immediately.
@@ -207,39 +182,54 @@ async fn run() -> AppResult<()> {
 
 async fn collect_targets(inputs: &[PathBuf]) -> AppResult<Vec<PathBuf>> {
     futures::stream::iter(inputs)
-        .flat_map(|input| {
-            if !input.exists() {
-                return futures::stream::once(futures::future::err(
-                    Report::new(AppError::InvalidInputPath)
-                        .attach(format!("Input path does not exist: {}", input.display())),
-                ))
-                .boxed();
-            }
+        .then(async |input| {
+            let metadata = match tokio::fs::metadata(input).await {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return futures::stream::once(futures::future::err(
+                        Report::new(AppError::InvalidInputPath)
+                            .attach(format!("Input path does not exist: {}", input.display())),
+                    ))
+                    .boxed();
+                }
+                Err(e) => {
+                    return futures::stream::once(futures::future::err(
+                        e.into_report()
+                            .change_context(AppError::InvalidInputPath)
+                            .attach(format!(
+                                "Could not inspect input path metadata: {}",
+                                input.display()
+                            )),
+                    ))
+                    .boxed();
+                }
+            };
 
-            if input.is_file() {
+            if metadata.is_file() {
                 return futures::stream::once(futures::future::ok(input.clone())).boxed();
             }
 
-            if input.is_dir() {
+            if metadata.is_dir() {
                 return walk_dir_stream(WalkDir::new(input.clone()).sort_by_file_name())
-                    .filter_map(|entry_result| async {
-                        match entry_result {
-                            Ok(entry) if entry.path().is_file() => Some(Ok(entry.into_path())),
-                            Ok(_) => None,
-                            Err(e) => {
-                                Some(Err(Report::new(AppError::DirectoryTraversal).attach(e)))
-                            }
-                        }
+                    .then(async |entry_result| match entry_result {
+                        Ok(entry) if entry.file_type().is_file() => Ok(Some(entry.into_path())),
+                        Ok(_) => Ok(None),
+                        Err(e) => Err(e
+                            .into_report()
+                            .change_context(AppError::DirectoryTraversal)
+                            .attach(format!("Root of dir walk: {:?}", input.clone()))),
                     })
+                    .filter_map(async |r| r.transpose())
                     .boxed();
             }
 
             futures::stream::empty().boxed()
         })
+        .flatten()
         .try_filter(|path| {
             let path = path.clone();
             async move {
-                let Ok(Some(kind)) = infer_cache::get_from_path(&path) else {
+                let Ok(Some(kind)) = infer_cache::get_from_path(&path).await else {
                     // Maybe it's a JSON file for the metadata
                     if let Some(ext) = path.extension().and_then(OsStr::to_str)
                         && ext.eq_ignore_ascii_case("json")
@@ -292,8 +282,6 @@ async fn print_plan(
 async fn apply_plan(
     plans: impl Stream<Item = AppResult<Box<dyn Plan>>>,
 ) -> (Counter<String>, AppResult<()>) {
-    use futures::TryStreamExt;
-
     let mut stream = pin!(
         plans
             .map_ok(|plan| async move {

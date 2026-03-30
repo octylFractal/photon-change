@@ -2,16 +2,25 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::{AppContext, AppError, AppResult, ImageKind, Plan, PlanResult, infer_cache};
+use crate::google_photos::find_google_photos_supplemental_metadata;
+use crate::{AppContext, AppError, AppResult, Plan, PlanResult, google_photos, infer_cache};
 use async_trait::async_trait;
 use error_stack::ResultExt;
 use futures::Stream;
-use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) struct FixImageExtPlan {
+    /// Rename for the base image.
+    image: FixImageExtRename,
+    /// Rename for Google Photos metadata JSON, if detected.
+    google_metadata: Option<FixImageExtRename>,
+}
+
+#[derive(Debug)]
+pub(crate) struct FixImageExtRename {
     from: PathBuf,
     to: PathBuf,
 }
@@ -27,27 +36,61 @@ impl Plan for FixImageExtPlan {
     }
 
     fn describe_dry_run(&self) -> String {
-        format!(
+        let base = format!(
             "Would rename {} to {}",
-            self.from.display(),
-            self.to.display()
-        )
+            self.image.from.display(),
+            self.image.to.display()
+        );
+        if let Some(google_metadata) = &self.google_metadata {
+            format!(
+                "{}, and {} to {}",
+                base,
+                google_metadata.from.display(),
+                google_metadata.to.display()
+            )
+        } else {
+            base
+        }
     }
 
     async fn execute(&self) -> AppResult<PlanResult> {
-        tokio::fs::rename(&self.from, &self.to)
-            .await
-            .change_context(AppError::RenameFailed)
-            .attach_with(|| {
-                format!(
-                    "Failed to rename {} to {}",
-                    self.from.display(),
-                    self.to.display()
-                )
-            })
-            .map(|_| PlanResult {
-                description: format!("Renamed {} to {}", self.from.display(), self.to.display()),
-            })
+        let renames = match self {
+            Self {
+                image,
+                google_metadata: Some(google_metadata),
+            } => vec![&image, google_metadata],
+            Self { image, .. } => vec![image],
+        };
+        for rename in renames {
+            tokio::fs::rename(&rename.from, &rename.to)
+                .await
+                .change_context(AppError::RenameFailed)
+                .attach_with(|| {
+                    format!(
+                        "Failed to rename {} to {}",
+                        rename.from.display(),
+                        rename.to.display()
+                    )
+                })?;
+        }
+
+        let base = format!(
+            "Renamed {} to {}",
+            self.image.from.display(),
+            self.image.to.display()
+        );
+        let description = if let Some(google_metadata) = &self.google_metadata {
+            format!(
+                "{}, and {} to {}",
+                base,
+                google_metadata.from.display(),
+                google_metadata.to.display()
+            )
+        } else {
+            base
+        };
+
+        Ok(PlanResult { description })
     }
 }
 
@@ -57,56 +100,46 @@ pub(crate) fn build_plans(
 ) -> impl Stream<Item = AppResult<FixImageExtPlan>> {
     use futures::StreamExt;
 
+    let reserved_set = Arc::new(scc::HashSet::new());
+
     futures::stream::iter(paths.into_iter().map(|path| async move {
-        let result = tokio::task::spawn_blocking({
-            let path = path.clone();
-            move || detect_image_kind(&path)
-        })
-        .await
-        .expect("detect_image_kind task panicked");
+        let result = detect_image_kind(&path).await;
         (path, result)
     }))
     .buffered(64)
-    .scan(
-        HashSet::<PathBuf>::new(),
-        move |reserved, (path, detected)| {
-            futures::future::ready(Some(plan_rename(log_context, reserved, path, detected)))
-        },
-    )
-    .flat_map(futures::stream::iter)
+    .filter_map(move |(path, detected)| {
+        let reserved_set = reserved_set.clone();
+        plan_rename(log_context, reserved_set, path, detected)
+    })
 }
 
-/// Normalize a path for case-insensitive comparison by lowercasing only the
-/// final filename component, leaving the directory part unchanged.
+/// Normalize a path for case-insensitive comparison (ASCII-only)
 fn ci_key(path: &Path) -> PathBuf {
-    match path.file_name().and_then(OsStr::to_str) {
-        Some(name) => match path.parent() {
-            Some(parent) => parent.join(name),
-            None => PathBuf::from(name),
-        },
-        None => path.to_path_buf(),
-    }
+    path.as_os_str().to_ascii_lowercase().into()
 }
 
 /// Returns `true` if any entry in `target`'s parent directory has the same
 /// name as `target` when compared case-insensitively.  This handles
 /// case-sensitive file systems where `photo.PNG` and `photo.png` are distinct
 /// paths but should still be treated as a collision.
-fn target_exists_case_insensitive(target: &Path) -> bool {
-    if target.exists() {
+async fn target_exists_case_insensitive(target: &Path) -> bool {
+    if let Ok(true) = tokio::fs::try_exists(target).await {
         return true;
     }
     let parent = target.parent().unwrap_or(Path::new("."));
-    let file_name = match target.file_name().and_then(OsStr::to_str) {
+    let file_name = match target.file_name() {
         Some(n) => n,
         None => return false,
     };
-    let file_name_lower = file_name.to_ascii_lowercase();
-    if let Ok(entries) = std::fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            if let Some(entry_name) = entry.file_name().to_str()
-                && entry_name.to_ascii_lowercase() == file_name_lower
-            {
+    if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(e)) => e,
+                Ok(_) => break,
+                // Swallow errors in finding entries for now.
+                Err(_) => continue,
+            };
+            if entry.file_name().eq_ignore_ascii_case(file_name) {
                 return true;
             }
         }
@@ -118,9 +151,9 @@ fn target_exists_case_insensitive(target: &Path) -> bool {
 ///
 /// Returns `Some(Ok(plan))` when a rename is needed, `Some(Err(_))` when
 /// detection failed, and `None` to silently skip the file.
-fn plan_rename(
+async fn plan_rename(
     app_context: AppContext,
-    reserved: &mut HashSet<PathBuf>,
+    reserved_set: Arc<scc::HashSet<PathBuf>>,
     path: PathBuf,
     detected: AppResult<Option<ImageKind>>,
 ) -> Option<AppResult<FixImageExtPlan>> {
@@ -159,26 +192,101 @@ fn plan_rename(
         return None;
     }
 
-    if !app_context.overwrite
-        && (target_exists_case_insensitive(&target) || reserved.contains(&ci_key(&target)))
-    {
+    if !add_name(app_context, &reserved_set, &path, &target).await {
+        return None;
+    }
+
+    let google_metadata_path = find_google_photos_supplemental_metadata(&path)
+        .await
+        .inspect_err(|e| {
+            eprintln!(
+                "Failed to check for Google Photos metadata for {}: {}",
+                path.display(),
+                e
+            );
+        })
+        .ok()
+        .flatten();
+
+    let google_metadata = match google_metadata_path {
+        Some(metadata_path) => {
+            let file_name = target.file_name()?.to_str()?;
+            let metadata_target =
+                metadata_path.with_file_name(google_photos::make_candidate(file_name, None));
+
+            if !add_name(app_context, &reserved_set, &metadata_path, &metadata_target).await {
+                None
+            } else {
+                Some(FixImageExtRename {
+                    from: metadata_path,
+                    to: metadata_target,
+                })
+            }
+        }
+        _ => None,
+    };
+
+    Some(Ok(FixImageExtPlan {
+        image: FixImageExtRename {
+            from: path,
+            to: target,
+        },
+        google_metadata,
+    }))
+}
+
+async fn add_name(
+    app_context: AppContext,
+    reserved_set: &scc::HashSet<PathBuf>,
+    path: &Path,
+    target: &Path,
+) -> bool {
+    let ci_key = ci_key(target);
+
+    let added = reserved_set.insert_async(ci_key).await.is_ok();
+
+    if !app_context.overwrite && (!added || target_exists_case_insensitive(target).await) {
         eprintln!(
             "Skipping {} (target already exists: {})",
             path.display(),
             target.display()
         );
-        return None;
+        return false;
     }
 
-    reserved.insert(ci_key(&target));
-    Some(Ok(FixImageExtPlan {
-        from: path,
-        to: target,
-    }))
+    true
 }
 
-fn detect_image_kind(path: &Path) -> AppResult<Option<ImageKind>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageKind {
+    Jpeg,
+    Png,
+    Gif,
+    Bmp,
+    Tiff,
+    Webp,
+    Ico,
+    Avif,
+}
+
+impl ImageKind {
+    fn canonical_extension(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpg",
+            Self::Png => "png",
+            Self::Gif => "gif",
+            Self::Bmp => "bmp",
+            Self::Tiff => "tif",
+            Self::Webp => "webp",
+            Self::Ico => "ico",
+            Self::Avif => "avif",
+        }
+    }
+}
+
+async fn detect_image_kind(path: &Path) -> AppResult<Option<ImageKind>> {
     let kind = infer_cache::get_from_path(path)
+        .await
         .change_context(AppError::FileTypeDetection)
         .attach_with(|| format!("Failed to inspect file type: {}", path.display()))?;
 

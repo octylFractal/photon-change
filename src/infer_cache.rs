@@ -2,33 +2,31 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use crate::toki_oh::asyncify;
 use infer::Type;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::LazyLock;
 
-type Cache = HashMap<PathBuf, Option<Type>>;
+type Cache = scc::HashMap<PathBuf, Option<Type>>;
 
-static CACHE: LazyLock<Arc<RwLock<Cache>>> =
-    LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
+static CACHE: LazyLock<Cache> = LazyLock::new(scc::HashMap::new);
 
-pub(crate) fn get_from_path<P: AsRef<Path>>(path: P) -> std::io::Result<Option<Type>> {
+pub(crate) async fn get_from_path<P: AsRef<Path>>(path: P) -> std::io::Result<Option<Type>> {
+    let cache = &CACHE;
     let path_ref = path.as_ref();
-    // Scope read so it drops the lock
-    {
-        let cache_read = CACHE.read().expect("lock poisoned");
-        if let Some(&result) = cache_read.get(path_ref) {
-            return Ok(result);
-        }
-    }
-    let mut cache_write = CACHE.write().expect("lock poisoned");
-
-    // Need to check if it was computed while we lost the lock
-    if let Some(&result) = cache_write.get(path_ref) {
+    // Try a quick read
+    if let Some(result) = cache.read_async(path_ref, |_, v| *v).await {
         return Ok(result);
     }
 
-    let result = infer::get_from_path(path_ref)?;
-    cache_write.insert(path_ref.to_path_buf(), result);
+    let entry = cache.entry_async(path_ref.to_path_buf()).await;
+    // Need to check if it was computed while getting the entry lock
+    if let scc::hash_map::Entry::Occupied(entry) = entry {
+        return Ok(*entry.get());
+    }
+
+    let path = path_ref.to_path_buf();
+    let result = asyncify("infer::get_from_path", move || infer::get_from_path(path)).await?;
+    entry.insert_entry(result);
     Ok(result)
 }
